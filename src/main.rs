@@ -41,6 +41,12 @@ enum Commands {
         #[arg(default_value = ".")]
         dir: String,
     },
+    /// Send one test ntfy push via the [ntfy] config section (no daemon needed)
+    NtfyTest {
+        /// Directory containing network.toml
+        #[arg(default_value = ".")]
+        dir: String,
+    },
 }
 
 #[tokio::main]
@@ -55,5 +61,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Status { dir } => echoeye::cli::status(&dir).await,
+        Commands::NtfyTest { dir } => echoeye::cli::ntfy_test(&dir).await,
     }
 }

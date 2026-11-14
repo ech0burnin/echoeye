@@ -63,6 +63,14 @@ pub async fn run(dir: &str) -> Result<()> {
         "event recorder armed (logs/events.jsonl)"
     );
 
+    // M4.1-b: optional ntfy push channel. Wire the forwarder BEFORE any
+    // monitor loop starts: the tap is an unbounded channel, so confirmed
+    // transitions observed during startup queue up and are pushed as
+    // soon as the forwarder task gets scheduled — nothing is lost.
+    if wire_ntfy(&state, &cfg).is_none() {
+        tracing::debug!("ntfy alerts off (no [ntfy] section)");
+    }
+
     // M2.6: SSH fallback transport — one TunnelManager from our node key,
     // enabled when node.key exists and parses. TOFU pins go next to it.
     let key_path = dir_path.join("node.key");
@@ -168,6 +176,87 @@ pub async fn run(dir: &str) -> Result<()> {
     }
 
     transport::serve(state, cfg.net.listen_port).await
+}
+
+/// M4.1-b: connect the ntfy push channel (if configured) to the event
+/// recorder's fan-out and start the forwarder task. Returns the
+/// forwarder handle, or `None` when the config has no `[ntfy]` section
+/// (feature off: nothing subscribed, nothing spawned — legacy path).
+///
+/// Called by `run` right after the event log is armed and before any
+/// monitor loop, so no confirmed transition can slip past the tap. The
+/// returned handle is deliberately dropped by the caller: the forwarder
+/// lives for the daemon's lifetime and ends when the recorder (holding
+/// the sending side) is dropped at shutdown.
+pub fn wire_ntfy(
+    state: &Arc<transport::NodeState>,
+    cfg: &NetworkConfig,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let ncfg = cfg.ntfy.as_ref()?;
+    // Same lock discipline as every observer of the recorder: a short
+    // std-mutex scope with no await inside (subscribe is synchronous).
+    let rx = state.events.lock().unwrap().subscribe();
+    let handle = crate::ntfy::spawn_forwarder(rx, ncfg.clone(), cfg.self_name.clone());
+    // The topic doubles as a push credential — never log it verbatim.
+    tracing::info!(
+        url = %ncfg.url,
+        topic = %mask_topic(&ncfg.topic),
+        "ntfy alerts enabled"
+    );
+    Some(handle)
+}
+
+/// M4.1-b: `echoeye ntfy-test <dir>` — push one test notification
+/// through the configured channel so the operator can verify the phone
+/// side without waiting for an incident. Reads network.toml directly:
+/// no running daemon is required (or contacted). Exit code: 0 on a
+/// confirmed 2xx delivery, non-zero otherwise (the anyhow Err
+/// propagates out of main).
+pub async fn ntfy_test(dir: &str) -> Result<()> {
+    let dir_path = Path::new(dir);
+    let cfg = NetworkConfig::load(&dir_path.join("network.toml"))
+        .with_context(|| format!("network.toml not found in {dir}; run `echoeye init` first"))?;
+    let ncfg = cfg.ntfy.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("no [ntfy] section in {dir}/network.toml — add url and topic first")
+    })?;
+    let now = crate::checks::chrono_pseudo::Ts::now();
+    let title = format!("echoeye test from {}", cfg.self_name);
+    let body = format!(
+        "channel check from node {} at unix {} ms",
+        cfg.self_name,
+        now.unix_ms()
+    );
+    // Recovery priority (default 3): a channel check must not blare like
+    // a confirmed-down siren — high priority stays reserved for real
+    // incidents.
+    crate::ntfy::send(
+        &crate::ntfy::client(),
+        &ncfg.url,
+        &ncfg.topic,
+        ncfg.priority_recovered,
+        &title,
+        &body,
+        &[],
+    )
+    .await
+    .with_context(|| "ntfy test push failed")?;
+    println!(
+        "sent to {}/{} — check your phone",
+        ncfg.url,
+        mask_topic(&ncfg.topic)
+    );
+    Ok(())
+}
+
+/// The ntfy topic doubles as an access credential (anyone who knows it
+/// can publish and subscribe): show at most its first 3 chars in logs
+/// and CLI output, ellipsis for anything longer.
+fn mask_topic(topic: &str) -> String {
+    let mut head: String = topic.chars().take(3).collect();
+    if topic.chars().count() > 3 {
+        head.push('…');
+    }
+    head
 }
 
 pub fn keygen() -> Result<()> {
@@ -449,5 +538,155 @@ mod tests {
         )
         .unwrap();
         assert!(status(dir2.to_str().unwrap()).await.is_ok(), "events file (with junk line) must not fail status");
+    }
+
+    // ---------- M4.1-b: ntfy wiring + ntfy-test CLI ----------
+
+    /// Minimal fake ntfy (real axum on loopback), same shape as the
+    /// harness in ntfy.rs: capture (path, decoded JSON body) of every
+    /// POST on the topic route.
+    async fn spawn_fake_ntfy(
+        status: axum::http::StatusCode,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>) {
+        let sink: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_route = sink.clone();
+        let routes = axum::Router::new().route(
+            "/test-topic",
+            axum::routing::post(move |uri: axum::http::Uri, body: String| {
+                let sink = sink_route.clone();
+                async move {
+                    sink.lock().unwrap().push((
+                        uri.path().to_string(),
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+                    ));
+                    status
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+        (port, sink)
+    }
+
+    /// Poll with an ASYNC sleep: the forwarder task shares this
+    /// current-thread runtime, a blocking std sleep would starve it
+    /// (lesson from M4.1-a).
+    async fn wait_for<F: Fn() -> bool>(cond: F) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "condition not met within 10s");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    fn ntfy_cfg(port: u16) -> crate::ntfy::NtfySection {
+        crate::ntfy::NtfySection {
+            url: format!("http://127.0.0.1:{port}"),
+            topic: "test-topic".into(),
+            priority_down: 4,
+            priority_recovered: 3,
+        }
+    }
+
+    #[test]
+    fn wire_ntfy_without_section_is_none_legacy_quiet() {
+        // No [ntfy] => feature off: nothing subscribed, nothing spawned,
+        // the daemon path before this milestone behaves exactly the same.
+        let cfg = NetworkConfig::bootstrap("s".into(), "n1".into());
+        assert!(cfg.ntfy.is_none());
+        let state = Arc::new(transport::NodeState::new(cfg.clone()));
+        assert!(wire_ntfy(&state, &cfg).is_none());
+    }
+
+    #[tokio::test]
+    async fn wire_ntfy_subscribes_recorder_and_pushes_down_event() {
+        let (port, sink) = spawn_fake_ntfy(axum::http::StatusCode::OK).await;
+        let mut cfg = NetworkConfig::bootstrap("s".into(), "n1".into());
+        cfg.net.flap_fail_threshold = 2;
+        cfg.ntfy = Some(ntfy_cfg(port));
+        let state = Arc::new(transport::NodeState::new(cfg.clone()));
+
+        let handle = wire_ntfy(&state, &cfg).expect("[ntfy] configured => forwarder wired");
+        assert!(!handle.is_finished(), "forwarder must stay alive");
+
+        // Drive the recorder exactly like the monitor loops do (short
+        // std-mutex scope, no await inside): up baseline, then two misses
+        // — threshold 2 confirms the down on the second, which must flow
+        // through the tap to the fake ntfy.
+        {
+            let mut rec = state.events.lock().unwrap();
+            rec.observe("site:x", true, 1, None);
+            rec.observe("site:x", false, 2, Some("HTTP 500"));
+            rec.observe("site:x", false, 3, Some("HTTP 500"));
+        }
+        wait_for(|| !sink.lock().unwrap().is_empty()).await;
+        let got = { sink.lock().unwrap().pop().unwrap() };
+        assert_eq!(got.0, "/test-topic");
+        assert_eq!(got.1["title"], "echoeye n1: DOWN site:x");
+        assert_eq!(got.1["priority"], 4);
+        assert_eq!(got.1["tags"], serde_json::json!(["rotating_light"]));
+        assert_eq!(got.1["message"], "HTTP 500");
+    }
+
+    #[tokio::test]
+    async fn ntfy_test_without_section_fails_with_clear_error() {
+        let cfg = NetworkConfig::bootstrap("s".into(), "n1".into());
+        let dir = tmp("ntfy-test-missing");
+        cfg.save(&dir.join("network.toml")).unwrap();
+        let err = ntfy_test(dir.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("[ntfy]"),
+            "error must point at the missing section: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ntfy_test_pushes_and_succeeds_against_fake_server() {
+        let (port, sink) = spawn_fake_ntfy(axum::http::StatusCode::OK).await;
+        let mut cfg = NetworkConfig::bootstrap("s".into(), "n1".into());
+        cfg.ntfy = Some(ntfy_cfg(port));
+        let dir = tmp("ntfy-test-ok");
+        cfg.save(&dir.join("network.toml")).unwrap();
+
+        // Ok(()) is what main turns into exit code 0.
+        ntfy_test(dir.to_str().unwrap())
+            .await
+            .expect("2xx from ntfy => Ok (exit 0)");
+        wait_for(|| !sink.lock().unwrap().is_empty()).await;
+        let got = { sink.lock().unwrap().pop().unwrap() };
+        assert_eq!(got.0, "/test-topic");
+        assert_eq!(got.1["title"], "echoeye test from n1");
+        assert!(
+            got.1["message"].as_str().unwrap().contains("node n1"),
+            "body must carry the node name: {}",
+            got.1["message"]
+        );
+        assert_eq!(got.1["priority"], 3, "channel check, not an alarm");
+    }
+
+    #[tokio::test]
+    async fn ntfy_test_server_500_is_err_nonzero_exit_path() {
+        let (port, _sink) = spawn_fake_ntfy(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let mut cfg = NetworkConfig::bootstrap("s".into(), "n1".into());
+        cfg.ntfy = Some(ntfy_cfg(port));
+        let dir = tmp("ntfy-test-500");
+        cfg.save(&dir.join("network.toml")).unwrap();
+        // Err propagates out of main => non-zero exit code.
+        assert!(
+            ntfy_test(dir.to_str().unwrap()).await.is_err(),
+            "5xx from the ntfy server must fail the command"
+        );
+    }
+
+    #[test]
+    fn mask_topic_keeps_first_three_chars_only() {
+        assert_eq!(mask_topic("topsecret-topic-9"), "top…");
+        assert_eq!(mask_topic("abcd"), "abc…");
+        assert_eq!(mask_topic("abc"), "abc");
+        assert_eq!(mask_topic(""), "");
     }
 }
