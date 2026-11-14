@@ -236,6 +236,23 @@ async fn three_node_matrix_full_and_survives_node_death() {
     // are exactly {(1,2),(1,3)}. Verify by banner: node-1's rows show the
     // TARGET's banner (fake-2 / fake-3), never its own.
     {
+        // same flake class as m35 (fixed in c94bf06): the poll above proves
+        // the snapshot carries the full mesh, but node-1's own table may lag
+        // one gossip round — poll instead of asserting blind
+        poll_until(
+            "node-1's own table holds the full mesh",
+            || async {
+                match rows_of(&obs, &nodes[0]).await {
+                    Some(m) => m.len() == 6
+                        && m.iter().any(|((f, _), p)| {
+                            *f == 1 && p.banner.as_deref().unwrap_or("").starts_with("SSH-2.0-fake-")
+                        }),
+                    None => false,
+                }
+            },
+            || diagnostics(&nodes, &obs),
+        )
+        .await;
         let m = rows_of(&obs, &nodes[0]).await.expect("node-1 alive");
         assert_eq!(m.len(), 6, "full table replicated on node-1 too");
         for ((from, _to), p) in &m {
