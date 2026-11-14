@@ -253,17 +253,36 @@ impl EventLog {
 pub struct EventRecorder {
     tracker: FlapTracker,
     log: Option<EventLog>,
+    /// M4.1: alert-channel taps (ntfy now, TG/Matrix later). Every
+    /// confirmed event is cloned into each subscriber; unbounded sends
+    /// are synchronous and never block, so the fan-out stays safe under
+    /// this recorder's std mutex (no await while locked — M3.7-b rule).
+    subscribers: Vec<tokio::sync::mpsc::UnboundedSender<Event>>,
 }
 
 impl EventRecorder {
     /// In-memory recorder; attach the file sink later with [`Self::set_log`]
     /// (tests and any file-less embedding never call it).
     pub fn new(threshold: u32) -> Self {
-        Self { tracker: FlapTracker::new(threshold), log: None }
+        Self {
+            tracker: FlapTracker::new(threshold),
+            log: None,
+            subscribers: Vec::new(),
+        }
     }
 
     pub fn set_log(&mut self, path: PathBuf) {
         self.log = Some(EventLog::new(path));
+    }
+
+    /// M4.1: open a fan-out tap on the confirmed-event stream (wired
+    /// into `ntfy::spawn_forwarder` by the daemon). Events that fired
+    /// before this call are not replayed — subscribers see transitions
+    /// from now on; events.jsonl remains the full history.
+    pub fn subscribe(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<Event> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.subscribers.push(tx);
+        rx
     }
 
     pub fn threshold(&self) -> u32 {
@@ -300,6 +319,11 @@ impl EventRecorder {
                 "recovered"
             ),
         }
+        // M4.1 fan-out: hand the event to every open alert-channel tap.
+        // A send error means the receiving side is gone (forwarder
+        // dropped its receiver): prune it silently — monitoring must
+        // outlive its notifiers.
+        self.subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
         Some(ev)
     }
 }
@@ -580,6 +604,56 @@ mod tests {
         assert_eq!(parsed.change, EventChange::Recovered);
         assert_eq!(parsed.target, "ssh:1->2");
         assert_eq!(parsed.detail, None);
+    }
+
+    // ---- M4.1: fan-out taps ----
+
+    #[test]
+    fn subscriber_receives_only_events_after_subscribe() {
+        let mut r = EventRecorder::new(2);
+        // Before any subscription: transitions fire, nobody to deliver to.
+        r.observe("site:x", true, 1, None);
+        assert_eq!(r.observe("site:x", false, 2, None), None); // streak #1
+
+        let mut rx = r.subscribe();
+        // Confirmed transition AFTER subscribe: delivered, verbatim.
+        let ev = r.observe("site:x", false, 3, Some("refused")).unwrap();
+        assert_eq!(ev.change, EventChange::Down);
+        assert_eq!(rx.try_recv().unwrap(), ev);
+        // Non-event observations deliver nothing (agrees with state).
+        r.observe("site:x", false, 4, None);
+        assert!(rx.try_recv().is_err());
+        // Baselines of new targets are not delivered either.
+        r.observe("site:z", true, 5, None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn two_subscribers_receive_the_same_events() {
+        let mut r = EventRecorder::new(1);
+        let mut a = r.subscribe();
+        let mut b = r.subscribe();
+        r.observe("unit:u", true, 1, None); // baseline
+        let ev = r.observe("unit:u", false, 2, None).unwrap();
+        assert_eq!(a.try_recv().unwrap(), ev);
+        assert_eq!(b.try_recv().unwrap(), ev);
+    }
+
+    #[test]
+    fn dead_subscriber_is_pruned_not_fatal() {
+        let mut r = EventRecorder::new(2);
+        let rx_dead = r.subscribe();
+        drop(rx_dead); // forwarder gone: its channel is closed
+        let mut rx_live = r.subscribe();
+        // observe right after the drop must not panic and must not
+        // disturb the live tap; the dead sender is pruned silently.
+        r.observe("node:2", true, 1, None); // baseline
+        assert_eq!(r.observe("node:2", false, 2, None), None); // streak #1
+        let ev = r.observe("node:2", false, 3, None).unwrap(); // streak #2 -> down
+        assert_eq!(ev.change, EventChange::Down);
+        assert_eq!(rx_live.try_recv().unwrap(), ev);
+        // And the prune actually happened (no zombie senders).
+        assert_eq!(r.subscribers.len(), 1);
     }
 
     // ---- liveness adapter ----

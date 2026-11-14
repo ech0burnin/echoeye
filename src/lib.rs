@@ -10,6 +10,7 @@ pub mod docker;
 pub mod elector;
 pub mod events;
 pub mod logging;
+pub mod ntfy;
 pub mod routing;
 pub mod selfstats;
 pub mod sitereport;

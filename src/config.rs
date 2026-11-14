@@ -53,6 +53,12 @@ pub struct NetworkConfig {
     /// the same key as both a table and an array of tables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<String>,
+    /// M4.1: per-node ntfy push channel for confirmed events. Optional
+    /// (absent = feature off, bit-for-bit legacy configs), local-only
+    /// like the `net`/`auth` knobs: NOT replicated by gossip and NOT
+    /// part of the admin hash — each node pushes (or not) on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntfy: Option<crate::ntfy::NtfySection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +259,9 @@ impl NetworkConfig {
             edges: Vec::new(),
             checks: Vec::new(),
             units: Vec::new(),
+            // M4.1: init deliberately does NOT create an [ntfy] section —
+            // the push channel is opt-in, the operator adds it by hand.
+            ntfy: None,
         };
         cfg.recompute_hash();
         cfg
@@ -725,6 +734,105 @@ network_secret = "s"
         assert_eq!(
             a.content_hash, b.content_hash,
             "units must not affect the admin hash"
+        );
+    }
+
+    // ---------- M4.1: ntfy section ----------
+
+    #[test]
+    fn ntfy_section_absent_by_default_and_roundtrip() {
+        // Legacy config (no [ntfy]): feature off, parses cleanly.
+        let raw = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.ntfy.is_none());
+
+        // Minimal section: priorities fall back to the 4/3 defaults.
+        let raw_min = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+[ntfy]
+url = "http://127.0.0.1:8888"
+topic = "test-topic"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw_min).unwrap();
+        let n = cfg.ntfy.as_ref().unwrap();
+        assert_eq!(n.priority_down, 4);
+        assert_eq!(n.priority_recovered, 3);
+
+        // Full section survives a save/load roundtrip (test endpoint
+        // only — real urls/topics never live in the repo).
+        let mut cfg = cfg.clone();
+        cfg.ntfy.as_mut().unwrap().priority_down = 5;
+        cfg.ntfy.as_mut().unwrap().priority_recovered = 2;
+        let dir = std::env::temp_dir().join("em-m41-config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("network.toml");
+        cfg.save(&p).unwrap();
+        let loaded = NetworkConfig::load(&p).unwrap();
+        assert_eq!(loaded.ntfy, cfg.ntfy);
+
+        // skip_serializing_if: a config WITHOUT the section re-saves
+        // without an [ntfy] table — legacy configs stay byte-clean.
+        let mut legacy = loaded;
+        legacy.ntfy = None;
+        legacy.save(&p).unwrap();
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("ntfy"));
+    }
+
+    #[test]
+    fn ntfy_unknown_field_rejected() {
+        // Strict parse (deny_unknown_fields) reaches the section too:
+        // a typo'd key must fail the load, not be silently ignored.
+        let raw = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+[ntfy]
+url = "http://127.0.0.1:8888"
+topic = "test-topic"
+prioity_down = 4
+"#;
+        assert!(toml::from_str::<NetworkConfig>(raw).is_err());
+    }
+
+    #[test]
+    fn ntfy_section_does_not_affect_admin_hash() {
+        // Push config is local-node tuning (same class as net.*): adding
+        // or editing [ntfy] must never shift the admin hash or the
+        // mesh would see phantom admin conflicts.
+        let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
+        let mut b = a.clone();
+        b.ntfy = Some(crate::ntfy::NtfySection {
+            url: "http://127.0.0.1:8888".into(),
+            topic: "test-topic".into(),
+            priority_down: 5,
+            priority_recovered: 1,
+        });
+        a.recompute_hash();
+        b.recompute_hash();
+        assert_eq!(
+            a.content_hash, b.content_hash,
+            "[ntfy] must not affect the admin hash"
         );
     }
 
