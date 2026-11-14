@@ -324,7 +324,20 @@ async fn docker_rows_replicate_via_gossip_and_go_stale_in_place() {
         assert_eq!(p1.containers[2].state, "exited");
         assert_eq!(p1.containers[2].health.as_deref(), Some("unhealthy"));
 
-        // replication is symmetric: node-1 holds the full table too
+        // replication is symmetric: node-1 holds the full table too —
+        // but it may lag one gossip round behind node-2 (the poll above
+        // only proves node-2's view), so poll instead of asserting blind
+        poll_until(
+            "node-1 holds the full table too",
+            || async {
+                table_of(&obs, &nodes[0])
+                    .await
+                    .map(|t| t.len() == 2)
+                    .unwrap_or(false)
+            },
+            || diagnostics(&nodes, &obs),
+        )
+        .await;
         let t1 = table_of(&obs, &nodes[0]).await.expect("node-1 alive");
         assert_eq!(t1.len(), 2, "full table replicated on node-1 as well");
 
