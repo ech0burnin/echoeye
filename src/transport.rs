@@ -72,11 +72,23 @@ pub struct NodeState {
     /// is async). None when `node.key` is absent/unusable (tests, plain
     /// status runs): no node gets a tunnel, behavior is M2.5-identical.
     pub tunnels: tokio::sync::Mutex<Option<crate::tunnel::TunnelManager>>,
+    /// M3.7: event recorder for confirmed state transitions of THIS
+    /// node's own observations (sites, ssh pairs, peer liveness, units).
+    /// Pure memory until `enable_events_log` attaches the JSONL sink —
+    /// the daemon does that in `cli::run`, tests stay file-free by
+    /// default. std Mutex on purpose: `observe` is synchronous and quick,
+    /// callers must never hold the guard across an await (clippy agrees).
+    pub events: Arc<std::sync::Mutex<crate::events::EventRecorder>>,
 }
 
 impl NodeState {
     pub fn new(cfg: NetworkConfig) -> Self {
         let evidence = seeded_evidence(&cfg);
+        // M3.7: recorder built from the config BEFORE cfg moves into the
+        // RwLock (same pattern as seeded_evidence above).
+        let events = Arc::new(std::sync::Mutex::new(
+            crate::events::EventRecorder::new(cfg.net.flap_fail_threshold),
+        ));
         Self {
             cfg: Arc::new(RwLock::new(cfg)),
             persist_path: None,
@@ -87,11 +99,15 @@ impl NodeState {
             ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
             docker: Arc::new(RwLock::new(HashMap::new())),
             tunnels: tokio::sync::Mutex::new(None),
+            events,
         }
     }
 
     pub fn with_persist(cfg: NetworkConfig, path: std::path::PathBuf) -> Self {
         let evidence = seeded_evidence(&cfg);
+        let events = Arc::new(std::sync::Mutex::new(
+            crate::events::EventRecorder::new(cfg.net.flap_fail_threshold),
+        ));
         Self {
             cfg: Arc::new(RwLock::new(cfg)),
             persist_path: Some(path),
@@ -102,7 +118,17 @@ impl NodeState {
             ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
             docker: Arc::new(RwLock::new(HashMap::new())),
             tunnels: tokio::sync::Mutex::new(None),
+            events,
         }
+    }
+
+    /// M3.7: attach the append-only JSONL sink for state-transition
+    /// events (`logs/events.jsonl`, rotated at 10 MiB). Called by the
+    /// daemon's `cli::run` right after the NodeState exists and BEFORE
+    /// any monitor loop starts; tests and file-less embeddings never
+    /// call it, so their recorders stay pure memory.
+    pub fn enable_events_log(&self, path: std::path::PathBuf) {
+        self.events.lock().unwrap().set_log(path);
     }
 
     /// M2.5: record a successful direct contact with `peer` (either
@@ -571,6 +597,31 @@ pub fn spawn_gossip_loop(state: Arc<NodeState>) -> tokio::task::JoinHandle<()> {
             let ok = results.iter().filter(|(_, l)| l.is_some()).count();
             tracing::debug!(peers = results.len(), ok, "gossip round done");
             let now_ms = crate::checks::chrono_pseudo::Ts::now().unix_ms();
+            // M3.7: fold peer liveness into the event recorder — this
+            // node's OWN view, one observation per known peer per round.
+            // Snapshots (node ids, evidence copy) are taken and dropped
+            // BEFORE the events lock: one lock at a time, never nested,
+            // never across an await. Uses the same evidence and the same
+            // dead threshold as the elector below, so an emitted
+            // "node:N down" means exactly "N stopped being electable by
+            // my view". Peers with no evidence record stay silent (never
+            // contacted is not "dead"), self is never observed.
+            {
+                let node_ids: Vec<u32> = {
+                    let g = state.cfg.read().unwrap();
+                    g.nodes.iter().map(|n| n.id).collect()
+                };
+                let evidence = state.evidence.read().unwrap().clone();
+                let mut recorder = state.events.lock().unwrap();
+                crate::events::observe_liveness(
+                    &mut recorder,
+                    self_id,
+                    &node_ids,
+                    &evidence,
+                    now_ms,
+                    t_dead_ms,
+                );
+            }
             let desired = {
                 let g = state.cfg.read().unwrap();
                 let evidence = state.evidence.read().unwrap();
@@ -1880,5 +1931,92 @@ mod tests {
                 forward_port: None,
             })
         );
+    }
+    // ---------- M3.7: liveness events from the gossip loop ----------
+
+    fn read_events(path: &std::path::Path) -> Vec<crate::events::Event> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn gossip_loop_records_peer_death_as_event() {
+        // Node-2 lives in its OWN runtime (m27 lesson: aborting an
+        // axum::serve task is not a kill — pooled connections keep
+        // answering); kill = shutdown_timeout(0), every socket drops at
+        // once. Node-1 (this test's runtime) runs the REAL gossip loop
+        // with the M3.7 recorder wired to a tempdir JSONL.
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_b = lb.local_addr().unwrap().port();
+        let rt_b = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let state_b = Arc::new(NodeState::new(NetworkConfig::bootstrap("test-secret".into(), "node-2".into())));
+        rt_b.spawn(async move {
+            axum::serve(lb, router(state_b)).await.unwrap();
+        });
+
+        // interval 1s -> t_dead 3s; recorder threshold 2 -> down after
+        // the 2nd stale observation, i.e. ~3s (stale) + 2 rounds.
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        cfg_a.net.gossip_interval_secs = 1;
+        cfg_a.net.flap_fail_threshold = 2;
+        cfg_a.nodes.push(NodeEntry {
+            id: 2,
+            name: "node-2".into(),
+            public_key: None,
+            address: Some(format!("127.0.0.1:{port_b}")),
+            ssh: None,
+        });
+        cfg_a.recompute_hash();
+        let state_a = Arc::new(NodeState::new(cfg_a));
+
+        let dir = std::env::temp_dir().join(format!("em-m37b-gossip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let events_path = dir.join("events.jsonl");
+        state_a.enable_events_log(events_path.clone());
+
+        spawn_gossip_loop(state_a.clone());
+
+        // Healthy phase: rounds succeed, evidence stays fresh — the
+        // baseline observation is silent, no events may appear.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            read_events(&events_path).is_empty(),
+            "healthy peer must not produce events: {:?}",
+            read_events(&events_path)
+        );
+
+        // Kill node-2; evidence freezes. Staleness needs t_dead (3s),
+        // then a 2nd stale round confirms down — poll with a deadline.
+        rt_b.shutdown_timeout(std::time::Duration::from_millis(0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        loop {
+            let evs = read_events(&events_path);
+            if evs
+                .iter()
+                .any(|e| e.target == "node:2" && e.change == crate::events::EventChange::Down)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node:2 down event never arrived, events: {evs:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        // Exactly one event: repeated stale rounds stay silent while
+        // down (fails pinned at the threshold until recovery).
+        let evs = read_events(&events_path);
+        assert_eq!(evs.len(), 1, "expected exactly one event, got: {evs:?}");
+        assert_eq!(evs[0].target, "node:2");
     }
 }

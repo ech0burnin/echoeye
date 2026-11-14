@@ -52,6 +52,17 @@ pub async fn run(dir: &str) -> Result<()> {
         dir_path.join("network.toml"),
     ));
 
+    // M3.7: attach the append-only event history BEFORE any monitor loop
+    // starts (gossip liveness, check engine, ssh matrix and units all
+    // observe into the same recorder) — logs/events.jsonl, rotated at
+    // 10 MiB. Until here the recorder is pure memory, which is exactly
+    // what direct NodeState users (tests) get.
+    state.enable_events_log(dir_path.join("logs").join("events.jsonl"));
+    tracing::info!(
+        flap_fail_threshold = cfg.net.flap_fail_threshold,
+        "event recorder armed (logs/events.jsonl)"
+    );
+
     // M2.6: SSH fallback transport — one TunnelManager from our node key,
     // enabled when node.key exists and parses. TOFU pins go next to it.
     let key_path = dir_path.join("node.key");
@@ -88,7 +99,13 @@ pub async fn run(dir: &str) -> Result<()> {
 
         let sink_state = state.clone();
         let sink_node = cfg.self_id;
-        let engine = crate::checks::Engine::new(10, 3).with_sink(std::sync::Arc::new(
+        // M3.7: recorder attached — probe outcomes feed the flap
+        // automaton, transitions become events (threshold comes from
+        // net.flap_fail_threshold via the recorder; the engine's own
+        // flap_threshold arg is the legacy no-recorder path only).
+        let engine = crate::checks::Engine::new(10, cfg.net.flap_fail_threshold)
+            .with_events(state.events.clone())
+            .with_sink(std::sync::Arc::new(
             move |rec: &crate::checks::CheckRecord| {
                 sink_state.record_own_probe(crate::checks::SiteProbe {
                     check_id: rec.check.clone(),
@@ -125,6 +142,10 @@ pub async fn run(dir: &str) -> Result<()> {
     // M3.6: periodic systemd unit liveness (`units = [...]` config).
     // Results land in the shared state and ride along with /api/state;
     // runtime data only — no gossip merge, no persistence, no hash impact.
+    // M3.7: observations also feed the event recorder (target
+    // "unit:<name>") — the pre-M3.7 unconditional "inactive units" warn
+    // every 30s is replaced by one down event per unit (warn, written by
+    // the recorder) and one recovered (info) when it comes back.
     if !cfg.units.is_empty() {
         let st = state.clone();
         let names = cfg.units.clone();
@@ -132,13 +153,13 @@ pub async fn run(dir: &str) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 let snapshot = crate::selfstats::collect_units(&names).await;
-                let dead: Vec<&str> = snapshot
-                    .iter()
-                    .filter(|u| !u.active)
-                    .map(|u| u.name.as_str())
-                    .collect();
-                if !dead.is_empty() {
-                    tracing::warn!(units = ?dead, "inactive systemd units");
+                let now_ms = crate::checks::chrono_pseudo::Ts::now().unix_ms();
+                {
+                    let mut recorder = st.events.lock().unwrap();
+                    for u in &snapshot {
+                        let target = format!("unit:{}", u.name);
+                        recorder.observe(&target, u.active, now_ms, None);
+                    }
                 }
                 st.set_units(snapshot);
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -350,5 +371,83 @@ pub async fn status(dir: &str) -> Result<()> {
             }
         }
     }
+    println!();
+    // M3.7: tail of this node's own event history — confirmed state
+    // transitions of what THIS node observes (sites, ssh pairs, peer
+    // liveness, units). Best effort: missing/empty file = no events yet;
+    // a stray non-JSON line falls back to raw text instead of failing.
+    println!("events:");
+    let events_path = dir_path.join("logs").join("events.jsonl");
+    let tail: Vec<String> = std::fs::read_to_string(&events_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if tail.is_empty() {
+        println!("  (no events yet)");
+    } else {
+        for line in tail.iter().rev().take(5).rev() {
+            let rendered = match serde_json::from_str::<crate::events::Event>(line) {
+                Ok(ev) => {
+                    let change = match ev.change {
+                        crate::events::EventChange::Down => "down",
+                        crate::events::EventChange::Recovered => "recovered",
+                    };
+                    format!(
+                        "{}  {:<24}  {}  {}",
+                        ev.at_ms,
+                        ev.target,
+                        change,
+                        ev.detail.as_deref().unwrap_or("")
+                    )
+                    .trim_end()
+                    .to_string()
+                }
+                Err(_) => line.clone(),
+            };
+            println!("  {rendered}");
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("em-m37b-cli-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn status_events_section_tolerates_missing_and_present_file() {
+        // No daemon on a privileged port: instant connection refusal, so
+        // status takes its "daemon offline" path and must still render
+        // the events section — with no events.jsonl at all.
+        let mut cfg = NetworkConfig::bootstrap("s".into(), "n1".into());
+        cfg.net.listen_port = 1;
+        let dir = tmp("missing");
+        cfg.save(&dir.join("network.toml")).unwrap();
+        assert!(status(dir.to_str().unwrap()).await.is_ok(), "missing events file must not fail status");
+
+        // With a populated events file (plus one junk line to prove the
+        // best-effort parse) status must succeed as well.
+        let dir2 = tmp("present");
+        std::fs::create_dir_all(dir2.join("logs")).unwrap();
+        cfg.save(&dir2.join("network.toml")).unwrap();
+        std::fs::write(
+            dir2.join("logs").join("events.jsonl"),
+            concat!(
+                "{\"at_ms\":1,\"target\":\"site:x\",\"change\":\"down\",\"detail\":null}\n",
+                "{\"at_ms\":2,\"target\":\"node:2\",\"change\":\"recovered\",\"detail\":null}\n",
+                "not-json-at-all\n",
+            ),
+        )
+        .unwrap();
+        assert!(status(dir2.to_str().unwrap()).await.is_ok(), "events file (with junk line) must not fail status");
+    }
 }

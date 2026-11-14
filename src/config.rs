@@ -17,6 +17,10 @@ pub const DEFAULT_GOSSIP_INTERVAL_SECS: u64 = 15;
 pub const DEFAULT_SSH_CHECK_INTERVAL_SECS: u64 = 60;
 /// M3.5: default cadence of the local docker container poll (seconds).
 pub const DEFAULT_DOCKER_CHECK_INTERVAL_SECS: u64 = 60;
+/// M3.7: how many consecutive failed observations confirm a target down
+/// in the event recorder (flap protection). The recorder clamps to >= 1
+/// (0 in the config means "down on the first miss", there is no "off").
+pub const DEFAULT_FLAP_FAIL_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +74,13 @@ pub struct NetSection {
     /// NEVER part of the admin hash.
     #[serde(default = "default_docker_check_interval")]
     pub docker_check_interval_secs: u64,
+    /// M3.7: consecutive failed observations needed to confirm a target
+    /// down in the event recorder (sites, ssh pairs, peer liveness,
+    /// units). Default 3; values are clamped to >= 1 by the recorder
+    /// itself, so 0 = "down on the first miss". Same rule as the other
+    /// `net` knobs: local-node runtime tuning, NEVER part of the admin hash.
+    #[serde(default = "default_flap_fail_threshold")]
+    pub flap_fail_threshold: u32,
 }
 
 fn default_listen_port() -> u16 {
@@ -86,6 +97,10 @@ fn default_ssh_check_interval() -> u64 {
 
 fn default_docker_check_interval() -> u64 {
     DEFAULT_DOCKER_CHECK_INTERVAL_SECS
+}
+
+fn default_flap_fail_threshold() -> u32 {
+    DEFAULT_FLAP_FAIL_THRESHOLD
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +240,7 @@ impl NetworkConfig {
                 gossip_interval_secs: DEFAULT_GOSSIP_INTERVAL_SECS,
                 ssh_check_interval_secs: DEFAULT_SSH_CHECK_INTERVAL_SECS,
                 docker_check_interval_secs: DEFAULT_DOCKER_CHECK_INTERVAL_SECS,
+                flap_fail_threshold: DEFAULT_FLAP_FAIL_THRESHOLD,
             },
             auth: AuthSection { network_secret },
             nodes: vec![NodeEntry {
@@ -808,11 +824,60 @@ network_secret = "s"
         assert_eq!(NetworkConfig::load(&p).unwrap().net.docker_check_interval_secs, 0);
     }
 
+    // ---------- M3.7: flap fail threshold ----------
+
+    #[test]
+    fn flap_threshold_default_and_roundtrip() {
+        // A legacy config (no flap_fail_threshold key) parses with the
+        // default: existing fleets get flap protection with zero edits.
+        let raw = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.net.flap_fail_threshold, DEFAULT_FLAP_FAIL_THRESHOLD);
+        assert_eq!(cfg.net.flap_fail_threshold, 3);
+
+        // An explicit value parses and survives a full save/load roundtrip.
+        let raw_on = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+flap_fail_threshold = 5
+[auth]
+network_secret = "s"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw_on).unwrap();
+        assert_eq!(cfg.net.flap_fail_threshold, 5);
+        let dir = std::env::temp_dir().join("em-m37-config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("network.toml");
+        cfg.save(&p).unwrap();
+        assert_eq!(NetworkConfig::load(&p).unwrap().net.flap_fail_threshold, 5);
+
+        // 0 roundtrips verbatim: it is a VALUE ("down on first miss",
+        // clamped to 1 inside FlapTracker), not an off-switch.
+        let mut zero = cfg.clone();
+        zero.net.flap_fail_threshold = 0;
+        zero.save(&p).unwrap();
+        assert_eq!(NetworkConfig::load(&p).unwrap().net.flap_fail_threshold, 0);
+    }
+
     #[test]
     fn net_fields_do_not_affect_admin_hash() {
         // The whole net section is local tuning, never admin content:
-        // differing listen ports / gossip, ssh-matrix and docker intervals
-        // must all hash identically (mesh nodes tune cadence independently).
+        // differing listen ports / gossip, ssh-matrix and docker
+        // intervals and the flap threshold must all hash identically
+        // (mesh nodes tune cadence and sensitivity independently).
         let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
         let mut b = a.clone();
         let mut c = a.clone();
@@ -820,8 +885,10 @@ network_secret = "s"
         b.net.gossip_interval_secs = 30;
         b.net.ssh_check_interval_secs = 5;
         b.net.docker_check_interval_secs = 7;
+        b.net.flap_fail_threshold = 5;
         c.net.ssh_check_interval_secs = 0;
         c.net.docker_check_interval_secs = 0;
+        c.net.flap_fail_threshold = 1;
         a.recompute_hash();
         b.recompute_hash();
         c.recompute_hash();

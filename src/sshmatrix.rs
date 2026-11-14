@@ -178,7 +178,25 @@ pub fn spawn_ssh_matrix_loop(state: Arc<NodeState>) -> Option<tokio::task::JoinH
             for (to, host, port) in targets {
                 let probe = ssh_probe(self_id, to, &host, port).await;
                 tracing::debug!(from = self_id, to, "ssh probe done");
+                // M3.7: our own pair observation feeds the event recorder
+                // (target convention "ssh:<from>-><to>"). Outcome and
+                // reason snippet are extracted BEFORE the probe moves
+                // into the shared table; the fail detail reuses the
+                // report's snippet cut so JSONL lines stay short.
+                let (ok, detail) = match &probe.outcome {
+                    CheckOutcome::Ok { .. } => (true, None),
+                    CheckOutcome::Fail { reason } | CheckOutcome::Unknown { reason } => {
+                        (false, Some(reason_snippet(reason)))
+                    }
+                };
+                let at_ms = probe.measured_at.unix_ms();
                 state.record_own_ssh_probe(probe);
+                // Lock discipline: the ssh-matrix lock was already
+                // released above — the events lock is taken alone and
+                // dropped as soon as observe returns.
+                let target = format!("ssh:{self_id}->{to}");
+                let mut recorder = state.events.lock().unwrap();
+                recorder.observe(&target, ok, at_ms, detail.as_deref());
             }
             retain_known(&state.ssh_matrix, &known_ids);
         }
@@ -580,5 +598,121 @@ mod tests {
         // nobody has ssh -> empty report
         let no_ssh = vec![node(1, "a", None), node(2, "b", None)];
         assert!(build_ssh_report(&no_ssh, &SshMatrix::new(), NOW, 60).is_empty());
+    }
+
+    // ---------- M3.7: recorder wiring ----------
+
+    fn read_events(path: &std::path::Path) -> Vec<crate::events::Event> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// A fake sshd serving `banner` on `port`; abort the returned task to
+    /// "kill the daemon" (the listener dies with the task). The port is
+    /// re-bindable right after (tokio sets SO_REUSEADDR).
+    fn spawn_banner_sshd(l: tokio::net::TcpListener, banner: &'static str) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = l.accept().await else { return };
+                let _ = sock.write_all(banner.as_bytes()).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn ssh_loop_records_pair_down_and_recovered_events() {
+        // Full arc through the REAL ssh-matrix loop: healthy fake sshd
+        // (baseline, silent) -> killed (TCP refused is a fast fail;
+        // threshold 2 -> down) -> revived on the same port (first Ok
+        // after down -> recovered). interval 1s, flap threshold 2.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let banner: &'static str = "SSH-2.0-FAKE_M37B\r\n";
+        let sshd = spawn_banner_sshd(l, banner);
+
+        let mut cfg = crate::config::NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        cfg.net.ssh_check_interval_secs = 1;
+        cfg.net.flap_fail_threshold = 2;
+        cfg.nodes.push(NodeEntry {
+            id: 2,
+            name: "node-2".into(),
+            public_key: None,
+            address: None,
+            ssh: dial("127.0.0.1", port),
+        });
+        cfg.recompute_hash();
+        let state = Arc::new(NodeState::new(cfg));
+
+        let dir = std::env::temp_dir().join(format!("em-m37b-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let events_path = dir.join("events.jsonl");
+        state.enable_events_log(events_path.clone());
+
+        spawn_ssh_matrix_loop(state.clone());
+
+        // Healthy phase: the first probe is the baseline (silent), the
+        // rest agree with it — no events while the pair is up.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            read_events(&events_path).is_empty(),
+            "healthy pair must not produce events: {:?}",
+            read_events(&events_path)
+        );
+
+        // Kill the sshd: connects are refused from now on; the 2nd
+        // consecutive fail confirms down.
+        sshd.abort();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let evs = read_events(&events_path);
+            if evs.iter().any(|e| {
+                e.target == "ssh:1->2" && e.change == crate::events::EventChange::Down
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ssh:1->2 down event never arrived, events: {evs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let down = read_events(&events_path);
+        let down_ev = down.iter().find(|e| e.target == "ssh:1->2").unwrap();
+        assert!(
+            down_ev.detail.as_deref().unwrap_or_default().contains("connect"),
+            "down detail should carry the fail reason, got: {:?}",
+            down_ev.detail
+        );
+
+        // Revive on the same port: first Ok observation -> recovered.
+        let l2 = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        spawn_banner_sshd(l2, banner);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let evs = read_events(&events_path);
+            if evs.iter().any(|e| {
+                e.target == "ssh:1->2" && e.change == crate::events::EventChange::Recovered
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ssh:1->2 recovered event never arrived, events: {evs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Exactly the down/recovered pair for the target, in order.
+        let evs = read_events(&events_path);
+        let pair: Vec<&crate::events::Event> =
+            evs.iter().filter(|e| e.target == "ssh:1->2").collect();
+        assert_eq!(pair.len(), 2, "expected exactly down+recovered, got: {evs:?}");
+        assert_eq!(pair[0].change, crate::events::EventChange::Down);
+        assert_eq!(pair[1].change, crate::events::EventChange::Recovered);
     }
 }

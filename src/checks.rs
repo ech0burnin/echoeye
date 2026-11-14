@@ -177,6 +177,12 @@ pub struct Engine {
     /// daemon can feed the gossip-shared probe table (M3.3). Pure observers
     /// (tests) leave it None.
     pub probe_sink: Option<ProbeSink>,
+    /// M3.7: optional event recorder (from `NodeState.events`). When
+    /// attached, every finished probe feeds the flap automaton and state
+    /// transitions become events (one warn per down, one info per
+    /// recovered — written by the recorder itself); the legacy
+    /// threshold-warn below is then suppressed to avoid double-reporting.
+    pub events: Option<Arc<std::sync::Mutex<crate::events::EventRecorder>>>,
 }
 
 impl Engine {
@@ -186,6 +192,7 @@ impl Engine {
             flap_threshold,
             histories: Arc::new(Mutex::new(std::collections::HashMap::new())),
             probe_sink: None,
+            events: None,
         }
     }
 
@@ -193,6 +200,17 @@ impl Engine {
     /// from the probe task; must not block).
     pub fn with_sink(mut self, sink: Arc<dyn Fn(&CheckRecord) + Send + Sync>) -> Self {
         self.probe_sink = Some(sink);
+        self
+    }
+
+    /// Attach the M3.7 event recorder (usually `NodeState.events`).
+    /// Threshold for the hysteresis comes from the recorder's own config
+    /// (`net.flap_fail_threshold`), not from `flap_threshold`.
+    pub fn with_events(
+        mut self,
+        events: Arc<std::sync::Mutex<crate::events::EventRecorder>>,
+    ) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -226,11 +244,37 @@ impl Engine {
                         sink(&rec);
                     }
                     let is_fail = !matches!(rec.outcome, CheckOutcome::Ok { .. });
+                    // M3.7: the failure reason rides along as the event
+                    // detail — extracted BEFORE the record is moved into
+                    // the history ring. Ok probes carry no detail.
+                    let detail = match &rec.outcome {
+                        CheckOutcome::Fail { reason } | CheckOutcome::Unknown { reason } => {
+                            Some(reason.clone())
+                        }
+                        CheckOutcome::Ok { .. } => None,
+                    };
+                    let at_ms = rec.at.unix_ms();
                     let mut h = hist.lock().await;
                     h.push(rec);
                     let fails = h.consecutive_fails();
                     drop(h);
-                    if is_fail && fails == engine.flap_threshold {
+                    if let Some(events) = &engine.events {
+                        // M3.7 path: hysteresis lives in the recorder
+                        // (target convention "site:<check_id>"); its own
+                        // warn/info lines are the signal — one per state
+                        // transition, not one per round. The std lock is
+                        // held only for the quick observe call, never
+                        // across an await.
+                        let target = format!("site:{}", spec.name);
+                        let _ = events.lock().unwrap().observe(
+                            &target,
+                            !is_fail,
+                            at_ms,
+                            detail.as_deref(),
+                        );
+                    } else if is_fail && fails == engine.flap_threshold {
+                        // Legacy path (no recorder attached, e.g. pure
+                        // engine tests): unchanged M3.1 behavior.
                         tracing::warn!(check = %spec.name, consecutive = fails, "CHECK FLAPPING: alert threshold reached");
                     }
                 }
@@ -367,6 +411,118 @@ mod tests {
         // clean shutdown signal
         let (tx, _rx) = tokio::sync::watch::channel(true);
         drop(tx);
+        handle.abort();
+    }
+
+    // ---------- M3.7: recorder wiring ----------
+
+    /// Fresh tempdir per test (parallel tests would collide otherwise).
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("em-m37b-engine-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn read_events(path: &std::path::Path) -> Vec<crate::events::Event> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn engine_with_events_writes_down_and_recovered_jsonl() {
+        // Flippable endpoint: teapot (fails the 200 expectation) until
+        // the flag flips, then plain 200-ok — one full down/recovered
+        // arc through the REAL engine loop and the M3.7 recorder.
+        use axum::response::IntoResponse;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let routes = axum::Router::new().route(
+            "/x",
+            axum::routing::get(move || {
+                let f = flag2.clone();
+                async move {
+                    if f.load(std::sync::atomic::Ordering::Relaxed) {
+                        "ok".into_response()
+                    } else {
+                        axum::http::StatusCode::IM_A_TEAPOT.into_response()
+                    }
+                }
+            }),
+        );
+        let port = spawn_server(routes).await;
+
+        let dir = tmp("engine");
+        let events_path = dir.join("events.jsonl");
+        let mut rec = crate::events::EventRecorder::new(2);
+        rec.set_log(events_path.clone());
+        let recorder = Arc::new(std::sync::Mutex::new(rec));
+
+        let engine = Arc::new(Engine::new(10, 2).with_events(recorder));
+        let specs = vec![HttpCheckSpec {
+            name: "ev".into(),
+            url: format!("http://127.0.0.1:{port}/x"),
+            expect: Some(200),
+            interval: Some(1),
+            timeout: None,
+        }];
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let e = engine.clone();
+        let handle = tokio::spawn(async move { e.run(specs, rx).await });
+
+        // Down: baseline fail seeds the streak, the 2nd consecutive fail
+        // confirms it (threshold 2). Poll with a deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let evs = read_events(&events_path);
+            if evs
+                .iter()
+                .any(|e| e.target == "site:ev" && e.change == crate::events::EventChange::Down)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "down event never arrived, events so far: {evs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Flip the endpoint healthy: the first Ok after down recovers.
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let evs = read_events(&events_path);
+            if evs.iter().any(|e| {
+                e.target == "site:ev" && e.change == crate::events::EventChange::Recovered
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recovered event never arrived, events so far: {evs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Exactly the pair, in order, with the fail reason as detail and
+        // no extra noise between the transitions.
+        let evs = read_events(&events_path);
+        let site: Vec<&crate::events::Event> =
+            evs.iter().filter(|e| e.target == "site:ev").collect();
+        assert_eq!(site.len(), 2, "expected exactly down+recovered, got: {evs:?}");
+        assert_eq!(site[0].change, crate::events::EventChange::Down);
+        assert!(
+            site[0].detail.as_deref().unwrap_or_default().contains("418"),
+            "down detail should carry the HTTP status, got: {:?}",
+            site[0].detail
+        );
+        assert_eq!(site[1].change, crate::events::EventChange::Recovered);
+
         handle.abort();
     }
 }
