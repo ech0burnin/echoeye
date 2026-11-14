@@ -8,6 +8,7 @@ pub mod config;
 pub mod crypto;
 pub mod docker;
 pub mod elector;
+pub mod events;
 pub mod logging;
 pub mod routing;
 pub mod selfstats;
