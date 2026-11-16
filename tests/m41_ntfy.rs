@@ -27,8 +27,10 @@
 //!   answering), the forwarder survives WITHOUT retrying the failed
 //!   push — and delivers the NEXT event as soon as the channel is
 //!   back (delivery is best-effort, never fatal, never blocking);
-//! * **legacy**: without `[ntfy]` the wiring subscribes nothing and
-//!   nothing is ever sent, while the event history keeps working;
+//! * **legacy**: without `[ntfy]` (and without a network channel)
+//!   nothing is ever sent, while the event history keeps working
+//!   (M4.4: the forwarder is always wired now — silence comes from
+//!   the per-event channel resolution, not a missing subscription);
 //! * **fan-out**: two checks confirm and push independently — four
 //!   pushes for two arcs, every title carrying node name AND target.
 
@@ -186,8 +188,8 @@ async fn spawn_node(cfg: NetworkConfig, events_path: PathBuf) -> (Node, Arc<Node
     // armed and before any monitor loop that can produce events.
     let wire_state = state.clone();
     rt.spawn(async move {
-        // Some: forwarder spawned (detached — the handle may drop);
-        // None: nothing subscribed, nothing spawned (legacy path).
+        // M4.4: the forwarder is ALWAYS spawned (per-event channel
+        // resolution: local [ntfy] > network channel > silent).
         let _ = echoeye::cli::wire_ntfy(&wire_state, &cfg);
     });
     let loop_state = state.clone();
@@ -736,10 +738,13 @@ async fn no_ntfy_section_is_legacy_silent() {
     );
     assert!(cfg.ntfy.is_none());
     let (mut node, state) = spawn_node(cfg.clone(), events_path.clone()).await;
-    // The same call run() makes wires nothing on a legacy config.
+    // M4.4 semantics: the wiring now ALWAYS subscribes and spawns
+    // (the channel resolves per event); the legacy guarantee that
+    // survives is the one below — without a local section AND without
+    // a network channel, nothing is ever sent anywhere.
     assert!(
-        echoeye::cli::wire_ntfy(&state, &cfg).is_none(),
-        "no [ntfy] section => no forwarder, no subscription"
+        echoeye::cli::wire_ntfy(&state, &cfg).is_some(),
+        "M4.4: the forwarder is always wired, silence comes from resolution"
     );
     let engine = spawn_check_engine(
         &node,

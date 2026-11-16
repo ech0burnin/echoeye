@@ -85,12 +85,23 @@ pub fn endpoint(url: &str, topic: &str) -> String {
 /// name makes pushes from different mesh nodes distinguishable when
 /// several nodes watch the same site (each pushes its own observation,
 /// consolidation is M4.5).
-pub fn title_for(ev: &Event, node: &str) -> String {
+///
+/// M4.4: when the current parent is a DIFFERENT node, the title gets
+/// a ` — parent <name>` suffix — the push tells the operator not just
+/// what happened but where the coordinator (and its future web UI)
+/// lives, reachable through the tunnel. This node's own pushes carry
+/// no suffix: "parent = the node you are reading" is zero information,
+/// and single-node meshes keep the exact pre-M4.4 title.
+pub fn title_for(ev: &Event, node: &str, parent: Option<&str>) -> String {
     let what = match ev.change {
         EventChange::Down => "DOWN",
         EventChange::Recovered => "RECOVERED",
     };
-    format!("echoeye {node}: {what} {}", ev.target)
+    let base = format!("echoeye {node}: {what} {}", ev.target);
+    match parent {
+        Some(p) => format!("{base} — parent {p}"),
+        None => base,
+    }
 }
 
 /// Push body: the event detail (or an explicit placeholder), truncated
@@ -181,7 +192,9 @@ pub fn spawn_forwarder(
                 &cfg.url,
                 &cfg.topic,
                 priority,
-                &title_for(&ev, &node_name),
+                // Static-config forwarder: no parent lookup here (the
+                // dynamic daemon forwarder lives in cli::wire_ntfy).
+                &title_for(&ev, &node_name, None),
                 &body_for(&ev),
                 tags_for(&ev),
             )
@@ -217,9 +230,24 @@ mod tests {
     #[test]
     fn title_carries_node_and_direction() {
         let down = ev(EventChange::Down, "site:importmath", Some("HTTP 500"));
-        assert_eq!(title_for(&down, "d1337"), "echoeye d1337: DOWN site:importmath");
+        assert_eq!(title_for(&down, "d1337", None), "echoeye d1337: DOWN site:importmath");
         let rec = ev(EventChange::Recovered, "node:2", None);
-        assert_eq!(title_for(&rec, "vps2"), "echoeye vps2: RECOVERED node:2");
+        assert_eq!(title_for(&rec, "vps2", None), "echoeye vps2: RECOVERED node:2");
+    }
+
+    #[test]
+    fn title_appends_parent_suffix_only_for_other_nodes() {
+        let down = ev(EventChange::Down, "site:x", None);
+        // Known parent on ANOTHER node: routing hint appended.
+        assert_eq!(
+            title_for(&down, "n1", Some("d1337")),
+            "echoeye n1: DOWN site:x — parent d1337"
+        );
+        // No parent elected yet: legacy title, no suffix.
+        assert_eq!(title_for(&down, "n1", None), "echoeye n1: DOWN site:x");
+        // The forwarder of the parent ITSELF never self-references
+        // (handled by the caller passing None when parent == self).
+        assert_eq!(title_for(&down, "d1337", None), "echoeye d1337: DOWN site:x");
     }
 
     #[test]

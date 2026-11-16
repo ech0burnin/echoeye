@@ -20,7 +20,7 @@
 // Items wired for later milestones (M2.5 elections read VerifiedNode) are exercised by tests only.
 #![allow(dead_code)]
 
-use crate::channels::ChannelState;
+use crate::channels::{ChannelState, DeliveryChannel};
 use crate::checks::SiteProbe;
 use crate::config::{admin_hash, EdgeEntry, NetworkConfig, NodeEntry};
 use crate::crypto;
@@ -794,6 +794,70 @@ async fn state_handler(State(state): State<Arc<NodeState>>) -> Json<GossipMessag
     Json(state.snapshot_msg())
 }
 
+/// M4.4: parent gate + monotonic version bump for the channel API.
+/// The parent is the single source of truth for the channel table —
+/// a set on a non-parent would fork versions across the mesh (see the
+/// split-brain note in channels.rs), so the endpoint refuses with 409
+/// instead. The bump is `current + 1` read under the same lock the
+/// merge uses, so every accepted change is strictly greater than the
+/// local state by construction (apply_channel's merge always applies).
+fn channel_apply(
+    state: &NodeState,
+    channel: Option<DeliveryChannel>,
+) -> Result<ChannelState, StatusCode> {
+    let self_id = state.cfg.read().unwrap().self_id;
+    let parent = *state.parent.read().unwrap();
+    if parent != Some(self_id) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let next = ChannelState {
+        version: state.channels.read().unwrap().version + 1,
+        channel,
+    };
+    state.apply_channel(Some(&next));
+    Ok(state.channels.read().unwrap().clone())
+}
+
+/// `POST /api/channel` (auth'd, parent-only): install or replace the
+/// mesh-wide delivery channel. Body = DeliveryChannel JSON (the same
+/// internally-tagged shape gossip carries). The next gossip round
+/// spreads the new state to every node; forwarders pick it up per
+/// event without restart. Reply = the resulting ChannelState.
+async fn channel_set(
+    State(state): State<Arc<NodeState>>,
+    Json(channel): Json<DeliveryChannel>,
+) -> Response {
+    match channel_apply(&state, Some(channel)) {
+        Ok(st) => {
+            tracing::info!(version = st.version, channel = %st.summary(), "channel set via API");
+            Json(st).into_response()
+        }
+        Err(code) => (
+            code,
+            "channel-set must run on the parent node (this node is not the current parent)",
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /api/channel` (auth'd, parent-only): alerts off for the
+/// whole mesh. Sets `channel: None` at version+1 — a real "explicitly
+/// cleared" state that propagates like any set (nodes with a local
+/// `[ntfy]` override keep pushing, by design).
+async fn channel_clear(State(state): State<Arc<NodeState>>) -> Response {
+    match channel_apply(&state, None) {
+        Ok(st) => {
+            tracing::info!(version = st.version, "channel cleared via API");
+            Json(st).into_response()
+        }
+        Err(code) => (
+            code,
+            "channel-clear must run on the parent node (this node is not the current parent)",
+        )
+            .into_response(),
+    }
+}
+
 /// M2.5: unauthenticated root — point a browser at the elected parent.
 /// 307 to the parent's address when known; otherwise a JSON hint with the
 /// parent id/name and the next hop (NAT'd parent case).
@@ -898,6 +962,44 @@ impl NodeClient {
         let resp = resp.error_for_status()?;
         Ok(resp.json().await?)
     }
+
+    /// M4.4: install/replace the mesh-wide delivery channel on the
+    /// daemon at `addr` (parent-only endpoint; a non-parent answers
+    /// 409 and the body text is surfaced in the error).
+    pub async fn set_channel(
+        &self,
+        addr: &str,
+        channel: &DeliveryChannel,
+    ) -> anyhow::Result<ChannelState> {
+        let url = format!("http://{}/api/channel", strip_scheme(addr));
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.auth_headers())
+            .json(channel)
+            .send()
+            .await?;
+        Self::decode_channel_reply(resp).await
+    }
+
+    /// M4.4: clear the mesh-wide delivery channel (alerts off).
+    pub async fn clear_channel(&self, addr: &str) -> anyhow::Result<ChannelState> {
+        let url = format!("http://{}/api/channel", strip_scheme(addr));
+        let resp = self.http.delete(&url).headers(self.auth_headers()).send().await?;
+        Self::decode_channel_reply(resp).await
+    }
+
+    /// Shared reply decoding for the channel API: non-2xx carries the
+    /// handler's explanation text (e.g. "must run on the parent
+    /// node"), success decodes into the resulting ChannelState.
+    async fn decode_channel_reply(resp: reqwest::Response) -> anyhow::Result<ChannelState> {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("channel API rejected (HTTP {status}): {body}");
+        }
+        Ok(resp.json().await?)
+    }
 }
 
 // ---------- router ----------
@@ -916,6 +1018,13 @@ pub fn router(state: Arc<NodeState>) -> Router {
         .route(
             "/api/state",
             get(state_handler).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            )),
+        )
+        .route(
+            "/api/channel",
+            post(channel_set).delete(channel_clear).route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             )),
@@ -1701,6 +1810,142 @@ mod tests {
             msg.channels.is_none(),
             "unknown kind degrades to None (ignored until upgrade)"
         );
+    }
+
+    // ---------- M4.4-b: channel API (parent gate + bump) ----------
+
+    fn delivery_ntfy(topic: &str, url: &str) -> DeliveryChannel {
+        DeliveryChannel::Ntfy {
+            url: url.into(),
+            topic: topic.into(),
+            priority_down: 4,
+            priority_recovered: 3,
+        }
+    }
+
+    #[test]
+    fn channel_apply_rejects_non_parent() {
+        // Start-up state: parent not elected yet (None) -> 409.
+        let state = test_state();
+        assert_eq!(
+            channel_apply(&state, Some(delivery_ntfy("test-topic", "http://127.0.0.1:9999"))),
+            Err(StatusCode::CONFLICT),
+            "no elected parent yet => refuse"
+        );
+        // Another node is the parent -> 409 too.
+        *state.parent.write().unwrap() = Some(2);
+        assert_eq!(
+            channel_apply(&state, Some(delivery_ntfy("test-topic", "http://127.0.0.1:9999"))),
+            Err(StatusCode::CONFLICT),
+            "this node is not the parent => refuse"
+        );
+        // Nothing leaked into the state through the refusals.
+        assert_eq!(*state.channels.read().unwrap(), ChannelState::unknown());
+    }
+
+    #[test]
+    fn channel_set_on_parent_applies_and_bumps() {
+        let dir = std::env::temp_dir().join("em-channel-api-set-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network.toml");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(dir.join(crate::channels::CACHE_FILENAME));
+
+        let state = Arc::new(NodeState::with_persist(
+            NetworkConfig::bootstrap("s".into(), "n1".into()),
+            path,
+        ));
+        // This node won the election.
+        *state.parent.write().unwrap() = Some(1);
+
+        let st = channel_apply(&state, Some(delivery_ntfy("test-topic", "http://127.0.0.1:9999")))
+            .expect("parent accepts a set");
+        assert_eq!(st.version, 1, "unknown(0) -> first set is version 1");
+        assert_eq!(st.channel.as_ref().unwrap().to_ntfy_params().topic, "test-topic");
+        assert_eq!(state.channels.read().unwrap().version, 1);
+        assert_eq!(
+            crate::channels::load_cache(&dir).version,
+            1,
+            "the API set refreshes channel.json like any merge"
+        );
+
+        // Second set: replace the channel at version 2 — the daemon,
+        // not the operator, owns the monotonic bump.
+        let st2 =
+            channel_apply(&state, Some(delivery_ntfy("test-topic-2", "http://127.0.0.1:9998")))
+                .expect("parent accepts a replace");
+        assert_eq!(st2.version, 2);
+        assert_eq!(
+            state
+                .channels
+                .read()
+                .unwrap()
+                .channel
+                .as_ref()
+                .unwrap()
+                .to_ntfy_params()
+                .topic,
+            "test-topic-2"
+        );
+    }
+
+    #[test]
+    fn channel_clear_sets_none_and_advances() {
+        let state = test_state();
+        *state.parent.write().unwrap() = Some(1);
+        channel_apply(&state, Some(delivery_ntfy("test-topic", "http://127.0.0.1:9999"))).unwrap();
+        let st = channel_apply(&state, None).expect("parent accepts a clear");
+        assert_eq!(st.version, 2, "clear bumps the version like a set");
+        assert_eq!(st.channel, None, "cleared = explicitly off, not unknown");
+        // The cleared state rides gossip (version > 0), so peers turn
+        // their pushes off too — asserted at the snapshot level.
+        assert!(state.snapshot_msg().channels.is_some());
+        assert!(state.snapshot_msg().channels.as_ref().unwrap().channel.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_endpoint_auth_and_full_http_roundtrip() {
+        // Route wiring + auth middleware + the client methods against
+        // a real axum server: 401 without a token, 409 on a
+        // non-parent, then set -> clear through NodeClient.
+        let state = test_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = state.clone();
+        tokio::spawn(async move { axum::serve(listener, router(srv)).await.unwrap() });
+        let addr = format!("127.0.0.1:{port}");
+
+        // No auth headers -> 401 (the middleware guards the route).
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/api/channel"))
+            .json(&serde_json::json!({"kind": "ntfy", "url": "http://127.0.0.1:9999", "topic": "test-topic"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+
+        let nc = NodeClient::new("test-secret".into(), 1);
+        // Not the parent yet -> 409 with the explanatory body.
+        let err = nc
+            .set_channel(&addr, &delivery_ntfy("test-topic", "http://127.0.0.1:9999"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("parent node"),
+            "409 body must explain the parent gate: {err}"
+        );
+
+        // Win the election -> set + clear round-trip over HTTP.
+        *state.parent.write().unwrap() = Some(1);
+        let st = nc
+            .set_channel(&addr, &delivery_ntfy("test-topic", "http://127.0.0.1:9999"))
+            .await
+            .unwrap();
+        assert_eq!(st.version, 1);
+        assert_eq!(state.channels.read().unwrap().version, 1, "HTTP set reached the state");
+        let st = nc.clear_channel(&addr).await.unwrap();
+        assert_eq!((st.version, st.channel), (2, None));
+        assert_eq!(state.channels.read().unwrap().channel, None);
     }
 
     #[tokio::test]

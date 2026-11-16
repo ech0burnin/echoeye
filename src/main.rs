@@ -41,9 +41,36 @@ enum Commands {
         #[arg(default_value = ".")]
         dir: String,
     },
-    /// Send one test ntfy push via the [ntfy] config section (no daemon needed)
+    /// Send one test ntfy push via the effective channel (local [ntfy]
+    /// or the network channel cache; no daemon needed)
     NtfyTest {
         /// Directory containing network.toml
+        #[arg(default_value = ".")]
+        dir: String,
+    },
+    /// Set the mesh-wide delivery channel on THIS node's daemon
+    /// (must be the parent node; the next gossip round spreads it)
+    ChannelSet {
+        /// Directory containing network.toml (of the parent node)
+        #[arg(default_value = ".")]
+        dir: String,
+        /// ntfy server base URL, e.g. https://push.example.tld
+        #[arg(long)]
+        url: String,
+        /// Target topic (deployment secret; masked in all output)
+        #[arg(long)]
+        topic: String,
+        /// Push priority for down events, ntfy 0-5 (default 4)
+        #[arg(long)]
+        priority_down: Option<u8>,
+        /// Push priority for recovered events, ntfy 0-5 (default 3)
+        #[arg(long)]
+        priority_recovered: Option<u8>,
+    },
+    /// Clear the mesh-wide delivery channel (alerts off for the mesh;
+    /// local [ntfy] overrides keep pushing)
+    ChannelClear {
+        /// Directory containing network.toml (of the parent node)
         #[arg(default_value = ".")]
         dir: String,
     },
@@ -62,5 +89,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status { dir } => echoeye::cli::status(&dir).await,
         Commands::NtfyTest { dir } => echoeye::cli::ntfy_test(&dir).await,
+        Commands::ChannelSet { dir, url, topic, priority_down, priority_recovered } => {
+            echoeye::cli::channel_set(&dir, &url, &topic, priority_down, priority_recovered).await
+        }
+        Commands::ChannelClear { dir } => echoeye::cli::channel_clear(&dir).await,
     }
 }
