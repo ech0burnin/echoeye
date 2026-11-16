@@ -291,6 +291,7 @@ pub async fn status(dir: &str) -> Result<()> {
                 seen: Vec::new(),
                 units: Vec::new(),
                 docker: Vec::new(),
+                channels: None,
             },
             false,
         ),

@@ -3,6 +3,7 @@
 //! M2.7's failover test drives the same gossip/election loop as `run`.
 
 pub mod checks;
+pub mod channels;
 pub mod cli;
 pub mod config;
 pub mod crypto;

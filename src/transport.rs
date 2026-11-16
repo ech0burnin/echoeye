@@ -20,6 +20,7 @@
 // Items wired for later milestones (M2.5 elections read VerifiedNode) are exercised by tests only.
 #![allow(dead_code)]
 
+use crate::channels::ChannelState;
 use crate::checks::SiteProbe;
 use crate::config::{admin_hash, EdgeEntry, NetworkConfig, NodeEntry};
 use crate::crypto;
@@ -68,6 +69,14 @@ pub struct NodeState {
     /// Runtime-only state: never persisted, never part of admin_hash;
     /// merged LWW on `measured_at` (see docker::merge_docker_probes).
     pub docker: Arc<RwLock<crate::docker::DockerTable>>,
+    /// M4.4: network delivery-channel state (first channel: ntfy push),
+    /// replicated through gossip with strictly-forward version merge
+    /// (see channels::merge_channel). Runtime-only like probes, but
+    /// additionally cached to `channel.json` next to network.toml
+    /// (persist_path parent) whenever the version advances — the cache
+    /// survives a cold reboot of the whole mesh, gossip alone would
+    /// not (the parent is runtime-only too).
+    pub channels: Arc<RwLock<ChannelState>>,
     /// M2.6: SSH fallback tunnel manager (tokio Mutex — building a tunnel
     /// is async). None when `node.key` is absent/unusable (tests, plain
     /// status runs): no node gets a tunnel, behavior is M2.5-identical.
@@ -98,6 +107,7 @@ impl NodeState {
             units: Arc::new(RwLock::new(Vec::new())),
             ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
             docker: Arc::new(RwLock::new(HashMap::new())),
+            channels: Arc::new(RwLock::new(ChannelState::unknown())),
             tunnels: tokio::sync::Mutex::new(None),
             events,
         }
@@ -117,6 +127,7 @@ impl NodeState {
             units: Arc::new(RwLock::new(Vec::new())),
             ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
             docker: Arc::new(RwLock::new(HashMap::new())),
+            channels: Arc::new(RwLock::new(ChannelState::unknown())),
             tunnels: tokio::sync::Mutex::new(None),
             events,
         }
@@ -167,6 +178,34 @@ impl NodeState {
         t.insert(probe.node_id, probe);
     }
 
+    /// M4.4: merge an inbound network channel state (strictly-forward
+    /// by version, see channels::merge_channel) and, when the state
+    /// advanced, refresh the `channel.json` cache next to network.toml
+    /// (persist_path parent; persist_path None in tests = no file).
+    /// Best-effort like persist(): cache write failure is a warn.
+    /// `None` incoming (peer knows nothing / undecodable payload) is a
+    /// no-op — never clears local state. Returns whether the version
+    /// advanced.
+    pub fn apply_channel(&self, incoming: Option<&ChannelState>) -> bool {
+        let Some(incoming) = incoming else { return false };
+        let mut st = self.channels.write().unwrap();
+        if !crate::channels::merge_channel(&mut st, incoming) {
+            return false;
+        }
+        if let Some(path) = &self.persist_path {
+            if let Some(dir) = path.parent() {
+                crate::channels::save_cache(dir, &st);
+            }
+        }
+        // The topic is a credential: only the masked summary is logged.
+        tracing::info!(
+            version = st.version,
+            channel = %st.summary(),
+            "network channel state advanced"
+        );
+        true
+    }
+
     /// Atomically persist the current config view (tmp file + rename).
     /// Best-effort: persistence failure is logged, never fatal.
     pub fn persist(&self) {
@@ -202,6 +241,13 @@ impl NodeState {
             .iter()
             .map(|(&id, &at_ms)| SeenEntry { id, at_ms })
             .collect();
+        // M4.4: share the channel state once we know anything (version
+        // > 0); version 0 stays off the wire (skip rule keeps empty
+        // snapshots byte-identical to pre-M4.4).
+        let channels = {
+            let c = self.channels.read().unwrap();
+            (c.version > 0).then(|| c.clone())
+        };
         GossipMessage {
             from: g.self_id,
             revision: g.revision,
@@ -212,6 +258,7 @@ impl NodeState {
             seen,
             units: self.units.read().unwrap().clone(),
             docker,
+            channels,
         }
     }
 }
@@ -245,6 +292,18 @@ pub struct GossipMessage {
     /// gossip, latest per node id. Same old-wire safety as probes/ssh.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docker: Vec<crate::docker::DockerProbe>,
+    /// M4.4: versioned network delivery-channel state (source of truth:
+    /// the parent node). Same old-wire safety as probes/ssh/docker —
+    /// old binaries ignore the field, our default for absent field is
+    /// None (no-op merge). Decoded leniently: an unknown channel `kind`
+    /// from a newer binary becomes None instead of failing the whole
+    /// topology message (see channels::deserialize_channels_gossip).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::channels::deserialize_channels_gossip"
+    )]
+    pub channels: Option<ChannelState>,
 }
 
 /// One liveness observation: node `id` was directly reachable at `at_ms`
@@ -547,6 +606,7 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
                 merge_probes(&state.probes, &reply.probes);
                 crate::sshmatrix::merge_ssh_probes(&state.ssh_matrix, &reply.ssh);
                 crate::docker::merge_docker_probes(&state.docker, &reply.docker);
+                state.apply_channel(reply.channels.as_ref());
                 merge_seen(&state.evidence, &reply.seen);
                 state.record_seen(peer_id, crate::checks::chrono_pseudo::Ts::now().unix_ms());
                 set_edge_latency(&state.cfg, self_id, peer_id, ms);
@@ -722,6 +782,7 @@ async fn gossip(
     merge_probes(&state.probes, &msg.probes);
     crate::sshmatrix::merge_ssh_probes(&state.ssh_matrix, &msg.ssh);
     crate::docker::merge_docker_probes(&state.docker, &msg.docker);
+    state.apply_channel(msg.channels.as_ref());
     merge_seen(&state.evidence, &msg.seen);
     state.record_seen(msg.from, crate::checks::chrono_pseudo::Ts::now().unix_ms());
     state.persist();
@@ -918,7 +979,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()), ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(7) }],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None,
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -939,7 +1000,7 @@ mod tests {
             revision: 2,
             nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None, ssh: None }],
             edges: vec![],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None,
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -962,7 +1023,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None,
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -989,7 +1050,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None,
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -1019,11 +1080,11 @@ mod tests {
         let msg_a_to_b = shared_a.read().unwrap().clone();
         merge_into(
             &shared_a,
-            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![] },
+            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None },
         );
         merge_into(
             &shared_b,
-            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![] },
+            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None },
         );
 
         let ga = shared_a.read().unwrap();
@@ -1057,7 +1118,7 @@ mod tests {
                 revision: 3,
                 nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None }],
                 edges: vec![],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None,
             },
         );
         state.persist();
@@ -1098,7 +1159,7 @@ mod tests {
             revision: 1,
             nodes: vec![],
             edges: vec![],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![], channels: None,
         };
         let reply = nc.gossip(&format!("127.0.0.1:{port}"), &msg).await.unwrap();
         assert_eq!(reply.from, 1);
@@ -1504,6 +1565,7 @@ mod tests {
             edges: vec![],
             probes: vec![], ssh: vec![], seen: vec![], units: vec![],
             docker: vec![docker_probe_of(2, 1_000, &["searxng"])],
+            channels: None,
         };
         let reply = gossip(State(state.clone()), Json(msg)).await;
         let t = state.docker.read().unwrap();
@@ -1513,6 +1575,132 @@ mod tests {
         // push-pull: our reply carries the freshly merged row back
         assert_eq!(reply.0.docker.len(), 1);
         assert_eq!(reply.0.docker[0].node_id, 2);
+    }
+
+    // ---------- M4.4: network delivery channels ----------
+
+    fn channel_state_of(version: u64, topic: &str) -> crate::channels::ChannelState {
+        crate::channels::ChannelState {
+            version,
+            channel: (version > 0).then(|| crate::channels::DeliveryChannel::Ntfy {
+                url: "http://127.0.0.1:9999".into(),
+                topic: topic.into(),
+                priority_down: 4,
+                priority_recovered: 3,
+            }),
+        }
+    }
+
+    #[test]
+    fn snapshot_msg_carries_channels_only_after_first_version() {
+        // version 0 = "know nothing": stays off the wire entirely
+        // (empty snapshots stay byte-identical to pre-M4.4)
+        let state = test_state();
+        assert!(state.snapshot_msg().channels.is_none());
+        let j = serde_json::to_value(state.snapshot_msg()).unwrap();
+        assert!(j.get("channels").is_none(), "skip rule keeps v0 off the wire");
+
+        // once a version exists the full state rides every snapshot
+        assert!(state.apply_channel(Some(&channel_state_of(1, "test-topic"))));
+        let msg = state.snapshot_msg();
+        let st = msg.channels.as_ref().expect("version 1 rides the snapshot");
+        assert_eq!(st.version, 1);
+        let j = serde_json::to_value(&msg).unwrap();
+        assert_eq!(j["channels"]["version"], 1);
+        assert_eq!(j["channels"]["channel"]["kind"], "ntfy");
+    }
+
+    #[test]
+    fn apply_channel_advances_state_and_caches_to_channel_json() {
+        let dir = std::env::temp_dir().join("em-channel-apply-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network.toml");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(dir.join(crate::channels::CACHE_FILENAME));
+
+        let state = Arc::new(NodeState::with_persist(
+            NetworkConfig::bootstrap("s".into(), "n1".into()),
+            path,
+        ));
+
+        // None incoming (peer knows nothing) never touches local state
+        assert!(!state.apply_channel(None));
+        assert_eq!(
+            *state.channels.read().unwrap(),
+            crate::channels::ChannelState::unknown()
+        );
+
+        // strictly-forward merge + channel.json written next to network.toml
+        assert!(state.apply_channel(Some(&channel_state_of(2, "test-topic"))));
+        assert_eq!(state.channels.read().unwrap().version, 2);
+        let cached = crate::channels::load_cache(&dir);
+        assert_eq!(cached.version, 2, "cache is refreshed when the version advances");
+
+        // equal/older incoming = no-op, local state untouched
+        assert!(!state.apply_channel(Some(&channel_state_of(2, "test-topic-2"))));
+        assert!(!state.apply_channel(Some(&channel_state_of(1, "test-topic-2"))));
+        assert_eq!(
+            state
+                .channels
+                .read()
+                .unwrap()
+                .channel
+                .as_ref()
+                .unwrap()
+                .to_ntfy_params()
+                .topic,
+            "test-topic",
+            "out-of-order gossip must not roll the channel back"
+        );
+    }
+
+    #[test]
+    fn apply_channel_without_persist_path_skips_cache() {
+        // plain NodeState::new (tests, in-memory runs) must not write
+        // any file — persist_path None means no cache, by design.
+        let state = test_state();
+        assert!(state.apply_channel(Some(&channel_state_of(3, "test-topic"))));
+        assert_eq!(state.channels.read().unwrap().version, 3);
+    }
+
+    #[test]
+    fn gossip_message_without_channels_field_parses() {
+        // Pre-M4.4 wire format (no channels key) must stay deserializable
+        // and merge as a no-op.
+        let raw = r#"{
+            "from": 2, "revision": 1,
+            "nodes": [], "edges": [], "probes": [], "seen": []
+        }"#;
+        let msg: GossipMessage = serde_json::from_str(raw).expect("legacy message parses");
+        assert!(msg.channels.is_none());
+
+        let state = test_state();
+        state.apply_channel(Some(&channel_state_of(1, "test-topic")));
+        state.apply_channel(msg.channels.as_ref());
+        assert_eq!(
+            state.channels.read().unwrap().version,
+            1,
+            "legacy peer cannot roll us back"
+        );
+    }
+
+    #[test]
+    fn gossip_message_with_unknown_channel_kind_degrades_to_none() {
+        // A NEWER binary gossiping a future channel kind (say
+        // "telegram") must not break topology exchange on this binary:
+        // channels::deserialize_channels_gossip turns it into None,
+        // the rest of the message merges as usual.
+        let raw = r#"{
+            "from": 2, "revision": 1,
+            "nodes": [], "edges": [], "probes": [], "seen": [],
+            "channels": { "version": 4, "channel": { "kind": "telegram", "chat": 42 } }
+        }"#;
+        let msg: GossipMessage =
+            serde_json::from_str(raw).expect("unknown kind must not fail the message");
+        assert!(
+            msg.channels.is_none(),
+            "unknown kind degrades to None (ignored until upgrade)"
+        );
     }
 
     #[tokio::test]
